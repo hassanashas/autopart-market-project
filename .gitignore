@@ -8,3 +8,5 @@ checkpoints/
 *.json
 *.ipynb
 *.json
+testing/
+.ipynb_checkpoints/
