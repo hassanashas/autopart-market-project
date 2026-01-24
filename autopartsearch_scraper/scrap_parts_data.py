@@ -9,6 +9,7 @@ from datetime import datetime
 import csv
 import multiprocessing as mp
 import random
+import time
 
 # ============================================================
 # GLOBAL RUN CONFIG
@@ -25,6 +26,37 @@ TEMP_DIR = os.path.join(RUN_ROOT, "temp")
 os.makedirs(FINAL_DIR, exist_ok=True)
 os.makedirs(TEMP_DIR, exist_ok=True)
 os.makedirs(LOG_DIR, exist_ok=True)
+
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/121.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+]
+
+PROXY_HOST = "geo.iproyal.com:12321"
+PROXY_AUTH = "DewbRx43TyL9c0VL:Pm9YlpYW09eOGRsj_country-us"
+
+PROXIES = {
+    "http": f"http://{PROXY_AUTH}@{PROXY_HOST}",
+    "https": f"http://{PROXY_AUTH}@{PROXY_HOST}"
+}
+
+USE_PROXY = True
+
+def create_session():
+    session = requests.Session()
+
+    if USE_PROXY:
+        session.proxies.update(PROXIES)
+        logger.info("Proxy enabled for session")
+    else:
+        logger.info("Proxy disabled for session")
+
+    session.headers.update({
+        "Accept": "text/html",
+        "Accept-Language": "en-US,en;q=0.9"
+    })
+
+    return session
 
 # ============================================================
 # LOGGING
@@ -307,14 +339,49 @@ def parse_new_layout(soup, interchange, yard_distances, application_meta):
 # SCRAPING CORE
 # ============================================================
 
-def fetch_page(url, timeout):
-    try:
-        response = requests.get(url, timeout=timeout)
-        response.raise_for_status()
-        return response.text
-    except Exception as e:
-        logger.error(f"Request failed | url={url} | error={e}")
-        return None
+def fetch_page(url, session, timeout, max_retries=3):
+    headers = {
+        "User-Agent": random.choice(USER_AGENTS)
+    }
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            response = session.get(
+                url,
+                headers=headers,
+                timeout=timeout
+            )
+            response.raise_for_status()
+
+            time.sleep(random.uniform(2.5, 5.5))
+            return response.text, len(response.content)
+
+        except requests.exceptions.Timeout as e:
+            logger.warning(
+                f"Timeout attempt {attempt} | {url} | {type(e).__name__}: {e}"
+            )
+            time.sleep(2 * attempt)
+
+        except requests.exceptions.ConnectionError as e:
+            logger.warning(
+                f"ConnectionError attempt {attempt} | {url} | {type(e).__name__}: {e}"
+            )
+            time.sleep(2 * attempt)
+
+        except requests.exceptions.HTTPError as e:
+            status = e.response.status_code if e.response else "unknown"
+            logger.warning(
+                f"HTTPError attempt {attempt} | {url} | status={status}"
+            )
+            return None, 0
+
+        except Exception as e:
+            logger.warning(
+                f"UnexpectedError attempt {attempt} | {url} | {type(e).__name__}: {e}"
+            )
+            time.sleep(2 * attempt)
+
+    return None, 0
 
 def scrape_autopartsearch(response_text, application_meta):
     soup = BeautifulSoup(response_text, "html.parser")
@@ -342,31 +409,41 @@ def scrape_autopartsearch(response_text, application_meta):
 
     return []
 
-def scrape_all_pages(base_url, application_meta, timeout=10, max_pages=1000):
+def scrape_all_pages(base_url, application_meta, session, timeout=10, max_pages=1000):
     all_parts = []
     page = 1
+
+    pages_scraped = 0
+    total_bytes = 0
 
     while page <= max_pages:
         page_url = base_url if page == 1 else f"{base_url}&currentpage={page}"
         logger.info(f"Fetching page {page}: {page_url}")
 
-        html = fetch_page(page_url, timeout)
+        html, page_size = fetch_page(page_url, session, timeout)
         if not html:
             break
 
         parts = scrape_autopartsearch(html, application_meta)
-        logger.info(f"Found {len(parts)} parts on page {page}")
+        logger.info(f"Found {len(parts)} parts on page {page} | size={page_size} bytes")
 
         if not parts:
             break
 
         all_parts.extend(parts)
+        pages_scraped += 1
+        total_bytes += page_size
         page += 1
 
-    return all_parts
+    return {
+        "parts": all_parts,
+        "pages_scraped": pages_scraped,
+        "total_bytes": total_bytes,
+        "avg_page_size": int(total_bytes / pages_scraped) if pages_scraped else 0
+    }
 
-def get_applications(base_url):
-    html = fetch_page(base_url, 10)
+def get_applications(base_url, session):
+    html, _ = fetch_page(base_url, session, 10)
     if not html:
         return []
 
@@ -384,18 +461,33 @@ def get_applications(base_url):
 
     return apps
 
-def scrape_with_applications(base_url):
-    applications = get_applications(base_url)
+def scrape_with_applications(base_url, session):
+    applications = get_applications(base_url, session)
+
     all_parts = []
+    total_pages = 0
+    total_bytes = 0
 
     if applications:
         for app in applications:
             logger.info(f"Scraping application {app['application_id']}")
-            all_parts.extend(scrape_all_pages(app["application_url"], app))
-    else:
-        all_parts.extend(scrape_all_pages(base_url, None))
+            result = scrape_all_pages(app["application_url"], app, session)
 
-    return all_parts
+            all_parts.extend(result["parts"])
+            total_pages += result["pages_scraped"]
+            total_bytes += result["total_bytes"]
+    else:
+        result = scrape_all_pages(base_url, None, session)
+        all_parts.extend(result["parts"])
+        total_pages += result["pages_scraped"]
+        total_bytes += result["total_bytes"]
+
+    return {
+        "parts": all_parts,
+        "pages_scraped": total_pages,
+        "total_bytes": total_bytes,
+        "avg_page_size": int(total_bytes / total_pages) if total_pages else 0
+    }
 
 # ============================================================
 # MULTIPROCESS WORKER
@@ -404,6 +496,7 @@ def scrape_with_applications(base_url):
 def scrape_record_worker(rec):
     global logger
     logger = logging.getLogger("autopartsearch_scraper")
+    session = create_session()
 
     try:
         base_name = f"{rec['make']}_{rec['year']}_{rec['model']}_{rec['part_slug']}"
@@ -414,7 +507,12 @@ def scrape_record_worker(rec):
             with open(temp_path, "r", encoding="utf8") as f:
                 return json.load(f)
 
-        parts = scrape_with_applications(rec["url"])
+        result = scrape_with_applications(rec["url"], session)
+
+        logger.info(
+            f"Completed {base_name} | pages={result['pages_scraped']} | bytes={result['total_bytes']}"
+        )
+        parts = result["parts"]
 
         for p in parts:
             p.update({
@@ -427,13 +525,31 @@ def scrape_record_worker(rec):
             })
 
         with open(temp_path, "w", encoding="utf8") as f:
-            json.dump(parts, f, indent=2)
+            json.dump(
+                {
+                    "parts": parts,
+                    "pages_scraped": result["pages_scraped"],
+                    "total_bytes": result["total_bytes"]
+                },
+                f,
+                indent=2
+            )
 
-        return parts
+        return {
+            "parts": parts,
+            "pages_scraped": result["pages_scraped"],
+            "total_bytes": result["total_bytes"]
+        }
 
-    except Exception:
-        logger.exception("Worker failure")
-        return []
+    except Exception as e:
+        logger.exception(
+            f"Worker failure | {type(e).__name__}: {e}"
+        )
+        return {
+            "parts": [],
+            "pages_scraped": 0,
+            "total_bytes": 0
+        }
 
 # ============================================================
 # MULTIPROCESS ENTRY
@@ -455,6 +571,8 @@ def scrape_from_csv(csv_path, workers=4):
     listener.start()
 
     all_parts = []
+    total_pages = 0
+    total_bytes = 0
 
     with mp.Pool(
         processes=workers,
@@ -462,12 +580,19 @@ def scrape_from_csv(csv_path, workers=4):
         initargs=(log_queue,)
     ) as pool:
         for result in pool.imap_unordered(scrape_record_worker, filtered):
-            all_parts.extend(result)
+            all_parts.extend(result["parts"])
+            total_pages += result["pages_scraped"]
+            total_bytes += result["total_bytes"]
 
     log_queue.put(None)
     listener.join()
 
-    return all_parts
+    return {
+        "parts": all_parts,
+        "total_pages": total_pages,
+        "total_bytes": total_bytes
+    }
+
 
 # ============================================================
 # RUN
@@ -478,7 +603,17 @@ if __name__ == "__main__":
 
     CSV_PATH = "output/parts_data.csv"
 
-    all_parts = scrape_from_csv(CSV_PATH, workers=4)
+    result = scrape_from_csv(CSV_PATH, workers=4)
+    all_parts = result["parts"]
+    total_pages = result["total_pages"]
+    total_bytes = result["total_bytes"]
+
+    logger.info(f"TOTAL pages scraped: {total_pages}")
+    logger.info(f"TOTAL bytes transferred: {total_bytes}")
+    logger.info(
+        f"AVERAGE page size: {int(total_bytes / total_pages) if total_pages else 0} bytes"
+    )
+
 
     final_path = os.path.join(FINAL_DIR, f"parts_data_{RUN_DATE}.json")
     with open(final_path, "w", encoding="utf8") as f:
