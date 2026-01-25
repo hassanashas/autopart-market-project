@@ -353,7 +353,7 @@ def fetch_page(url, session, timeout, max_retries=3):
             )
             response.raise_for_status()
 
-            time.sleep(random.uniform(2.5, 5.5))
+            # time.sleep(random.uniform(2.5, 5.5))
             return response.text, len(response.content)
 
         except requests.exceptions.Timeout as e:
