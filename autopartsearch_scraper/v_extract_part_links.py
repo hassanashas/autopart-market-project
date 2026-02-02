@@ -16,7 +16,8 @@ from webdriver_manager.chrome import ChromeDriverManager
 # ============================================================
 
 BASE_URL = "https://autopartsearch.com/"
-MIN_YEAR = 1960
+MIN_YEAR = 2006
+MAX_YEAR = 2013
 NUM_WORKERS = 5
 
 LOG_DIR = "logs"
@@ -205,7 +206,7 @@ def main():
     years = get_select_options(temp_driver, "select#afmkt-year")
     temp_driver.quit()
 
-    years = [y for y in years if int(y) >= MIN_YEAR]
+    years = [y for y in years if int(y) >= MIN_YEAR and int(y) <= MAX_YEAR]
     # sort newest to oldest
     years = sorted(years, reverse=True)
     

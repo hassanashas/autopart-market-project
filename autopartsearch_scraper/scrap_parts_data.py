@@ -7,7 +7,9 @@ import logging
 import logging.handlers
 from datetime import datetime
 import csv
-import multiprocessing as mp
+import asyncio
+import aiohttp
+from aiohttp.client_exceptions import ClientConnectorError
 import random
 import time
 
@@ -42,27 +44,28 @@ PROXIES = {
 
 USE_PROXY = True
 
-def create_session():
-    session = requests.Session()
-
-    if USE_PROXY:
-        session.proxies.update(PROXIES)
-        logger.info("Proxy enabled for session")
-    else:
-        logger.info("Proxy disabled for session")
-
-    session.headers.update({
+def get_aiohttp_session():
+    headers = {
         "Accept": "text/html",
         "Accept-Language": "en-US,en;q=0.9"
-    })
+    }
 
-    return session
+    timeout = aiohttp.ClientTimeout(total=30)
+
+    if USE_PROXY:
+        return aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout
+        )
+    else:
+        return aiohttp.ClientSession(
+            headers=headers,
+            timeout=timeout
+        )
 
 # ============================================================
 # LOGGING
 # ============================================================
-
-WORKER_LOG_QUEUE = None
 
 def setup_logger():
     logger = logging.getLogger("autopartsearch_scraper")
@@ -89,24 +92,6 @@ def setup_logger():
 
     return logger
 
-def log_listener(queue):
-    logger = setup_logger()
-    while True:
-        record = queue.get()
-        if record is None:
-            break
-        logger.handle(record)
-
-def setup_worker_logger(queue):
-    global WORKER_LOG_QUEUE
-    WORKER_LOG_QUEUE = queue
-
-    logger = logging.getLogger("autopartsearch_scraper")
-    logger.setLevel(logging.INFO)
-    logger.handlers.clear()
-    logger.addHandler(logging.handlers.QueueHandler(queue))
-    return logger
-
 logger = setup_logger()
 logger.info("Starting AutoPartSearch scrape")
 
@@ -116,19 +101,35 @@ logger.info("Starting AutoPartSearch scrape")
 
 def load_catalog_urls(csv_path):
     urls = []
+    seen_urls = set()
+
     with open(csv_path, newline="", encoding="utf8") as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # Skip rows without a valid link
+            if row.get("link_found", "").lower() != "true":
+                continue
+
             url = row.get("url")
-            if url:
-                urls.append({
-                    "year": row.get("year"),
-                    "make": row.get("manufacturer"),
-                    "model": row.get("model_name"),
-                    "part_name": row.get("part_name"),
-                    "part_slug": row.get("part_slug"),
-                    "url": url
-                })
+            if not url:
+                continue
+
+            # Deduplicate on URL
+            if url in seen_urls:
+                continue
+
+            seen_urls.add(url)
+
+            urls.append({
+                "year": row.get("year"),
+                "make": row.get("manufacturer"),
+                "model": row.get("model_name"),
+                "part_name": row.get("part_name"),
+                "part_slug": row.get("part_slug"),
+                "url": url,
+                "ic_description": row.get("ic_description"),
+            })
+
     return urls
 
 # ============================================================
@@ -148,6 +149,14 @@ def parse_address(lines):
         phone = lines[-1].strip()
 
     return city, state, phone
+
+def normalize_text(s):
+    if not s:
+        return ""
+    s = s.lower()
+    s = re.sub(r"\(\d+\)$", "", s)
+    s = re.sub(r"\s+", " ", s)
+    return s.strip()
 
 # ============================================================
 # OLD LAYOUT PARSER
@@ -339,47 +348,40 @@ def parse_new_layout(soup, interchange, yard_distances, application_meta):
 # SCRAPING CORE
 # ============================================================
 
-def fetch_page(url, session, timeout, max_retries=3):
+SEM = asyncio.Semaphore(15)
+
+async def fetch_page(url, session, timeout=15, max_retries=3):
     headers = {
         "User-Agent": random.choice(USER_AGENTS)
     }
 
+    proxy = PROXIES["http"] if USE_PROXY else None
+
     for attempt in range(1, max_retries + 1):
         try:
-            response = session.get(
-                url,
-                headers=headers,
-                timeout=timeout
-            )
-            response.raise_for_status()
+            async with SEM:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    proxy=proxy,
+                    timeout=timeout
+                ) as response:
+                    response.raise_for_status()
+                    text = await response.text()
+                    size = len(text.encode("utf8"))
+                    return text, size
 
-            # time.sleep(random.uniform(2.5, 5.5))
-            return response.text, len(response.content)
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout attempt {attempt} | {url}")
+            await asyncio.sleep(2 * attempt)
 
-        except requests.exceptions.Timeout as e:
-            logger.warning(
-                f"Timeout attempt {attempt} | {url} | {type(e).__name__}: {e}"
-            )
-            time.sleep(2 * attempt)
+        except ClientConnectorError as e:
+            logger.warning(f"Connection error attempt {attempt} | {url} | {e}")
+            await asyncio.sleep(2 * attempt)
 
-        except requests.exceptions.ConnectionError as e:
-            logger.warning(
-                f"ConnectionError attempt {attempt} | {url} | {type(e).__name__}: {e}"
-            )
-            time.sleep(2 * attempt)
-
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response else "unknown"
-            logger.warning(
-                f"HTTPError attempt {attempt} | {url} | status={status}"
-            )
-            return None, 0
-
-        except Exception as e:
-            logger.warning(
-                f"UnexpectedError attempt {attempt} | {url} | {type(e).__name__}: {e}"
-            )
-            time.sleep(2 * attempt)
+        except aiohttp.ClientError as e:
+            logger.warning(f"HTTP error attempt {attempt} | {url} | {e}")
+            await asyncio.sleep(2 * attempt)
 
     return None, 0
 
@@ -409,7 +411,16 @@ def scrape_autopartsearch(response_text, application_meta):
 
     return []
 
-def scrape_all_pages(base_url, application_meta, session, timeout=10, max_pages=1000):
+async def scrape_all_pages(
+        base_url,
+        application_meta,
+        session,
+        record_idx,
+        total_records,
+        timeout=10,
+        max_pages=1000
+    ):
+
     all_parts = []
     page = 1
 
@@ -418,14 +429,20 @@ def scrape_all_pages(base_url, application_meta, session, timeout=10, max_pages=
 
     while page <= max_pages:
         page_url = base_url if page == 1 else f"{base_url}&currentpage={page}"
-        logger.info(f"Fetching page {page}: {page_url}")
+        logger.info(
+            f"Record {record_idx} of {total_records} | "
+            f"Fetching page {page} | {page_url}"
+        )
 
-        html, page_size = fetch_page(page_url, session, timeout)
+        html, page_size = await fetch_page(page_url, session, timeout)
         if not html:
             break
 
         parts = scrape_autopartsearch(html, application_meta)
-        logger.info(f"Found {len(parts)} parts on page {page} | size={page_size} bytes")
+        logger.info(
+            f"Record {record_idx} of {total_records} | "
+            f"Page {page} returned {len(parts)} parts | size={page_size} bytes"
+        )
 
         if not parts:
             break
@@ -442,8 +459,8 @@ def scrape_all_pages(base_url, application_meta, session, timeout=10, max_pages=
         "avg_page_size": int(total_bytes / pages_scraped) if pages_scraped else 0
     }
 
-def get_applications(base_url, session):
-    html, _ = fetch_page(base_url, session, 10)
+async def get_applications(base_url, session):
+    html, _ = await fetch_page(base_url, session, 10)
     if not html:
         return []
 
@@ -461,23 +478,55 @@ def get_applications(base_url, session):
 
     return apps
 
-def scrape_with_applications(base_url, session):
-    applications = get_applications(base_url, session)
+async def scrape_with_applications(base_url, session, record_idx, total_records, ic_description):
+    applications = await get_applications(base_url, session)
 
     all_parts = []
     total_pages = 0
     total_bytes = 0
 
-    if applications:
+    if applications and ic_description:
+        target = normalize_text(ic_description)
+
+        matched_apps = [
+            app for app in applications
+            if normalize_text(app["application_text"]) == target
+        ]
+
+        if not matched_apps:
+            logger.warning(
+                f"Record {record_idx} of {total_records} | "
+                f"No application matched ic_description | {ic_description}"
+            )
+            return {
+                "parts": [],
+                "pages_scraped": 0,
+                "total_bytes": 0,
+                "avg_page_size": 0
+            }
+
+        applications = matched_apps
+
         for app in applications:
-            logger.info(f"Scraping application {app['application_id']}")
-            result = scrape_all_pages(app["application_url"], app, session)
+            logger.info(
+                f"Record {record_idx} of {total_records} | "
+                f"Scraping application {app['application_id']}"
+            )
+
+            logger.info(
+                f"Application details | "
+                f"id={app['application_id']} | "
+                f"text={app['application_text']} | "
+                f"url={app['application_url']}"
+            )
+            
+            result = await scrape_all_pages(app["application_url"], app, session, record_idx, total_records)
 
             all_parts.extend(result["parts"])
             total_pages += result["pages_scraped"]
             total_bytes += result["total_bytes"]
     else:
-        result = scrape_all_pages(base_url, None, session)
+        result = await scrape_all_pages(base_url, None, session, record_idx, total_records)
         all_parts.extend(result["parts"])
         total_pages += result["pages_scraped"]
         total_bytes += result["total_bytes"]
@@ -490,15 +539,16 @@ def scrape_with_applications(base_url, session):
     }
 
 # ============================================================
-# MULTIPROCESS WORKER
+# ASYNC WORKER
 # ============================================================
 
-def scrape_record_worker(rec):
-    global logger
-    logger = logging.getLogger("autopartsearch_scraper")
-    session = create_session()
-
+async def scrape_record(rec, record_idx, total_records, session):
     try:
+        start_ts = time.perf_counter()
+        logger.info(
+            f"Starting record {record_idx} of {total_records} | "
+            f"{rec['make']} {rec['year']} {rec['model']} {rec['part_slug']}"
+        )
         base_name = f"{rec['make']}_{rec['year']}_{rec['model']}_{rec['part_slug']}"
         base_name = re.sub(r"[^a-zA-Z0-9_]", "_", base_name)
         temp_path = os.path.join(TEMP_DIR, f"{base_name}.json")
@@ -507,11 +557,14 @@ def scrape_record_worker(rec):
             with open(temp_path, "r", encoding="utf8") as f:
                 return json.load(f)
 
-        result = scrape_with_applications(rec["url"], session)
-
-        logger.info(
-            f"Completed {base_name} | pages={result['pages_scraped']} | bytes={result['total_bytes']}"
+        result = await scrape_with_applications(
+            rec["url"],
+            session,
+            record_idx,
+            total_records,
+            rec.get("ic_description")
         )
+
         parts = result["parts"]
 
         for p in parts:
@@ -524,68 +577,62 @@ def scrape_record_worker(rec):
                 "source_url": rec["url"],
             })
 
-        with open(temp_path, "w", encoding="utf8") as f:
-            json.dump(
-                {
-                    "parts": parts,
-                    "pages_scraped": result["pages_scraped"],
-                    "total_bytes": result["total_bytes"]
-                },
-                f,
-                indent=2
-            )
+        elapsed_sec = round(time.perf_counter() - start_ts, 2)
+        result["record_runtime_seconds"] = elapsed_sec
 
-        return {
-            "parts": parts,
-            "pages_scraped": result["pages_scraped"],
-            "total_bytes": result["total_bytes"]
-        }
+        with open(temp_path, "w", encoding="utf8") as f:
+            json.dump(result, f, indent=2)
+
+        logger.info(
+            f"Finished record {record_idx} of {total_records} | "
+            f"pages={result['pages_scraped']} | "
+            f"bytes={result['total_bytes']} | "
+            f"time={elapsed_sec}s | "
+            f"seconds_per_page={round(elapsed_sec / result['pages_scraped'], 2) if result['pages_scraped'] else 0}"
+        )
+
+        return result
 
     except Exception as e:
-        logger.exception(
-            f"Worker failure | {type(e).__name__}: {e}"
-        )
-        return {
-            "parts": [],
-            "pages_scraped": 0,
-            "total_bytes": 0
-        }
+        logger.exception(f"Worker failure | {e}")
+        return {"parts": [], "pages_scraped": 0, "total_bytes": 0}
 
 # ============================================================
-# MULTIPROCESS ENTRY
+# ASYNC ENTRY
 # ============================================================
 
-def scrape_from_csv(csv_path, workers=4):
+async def scrape_from_csv(csv_path):
     records = load_catalog_urls(csv_path)
 
-    sample_size = min(500, len(records))
-    records = random.sample(records, sample_size)
+    # sample_size = min(2, len(records))
+    # records = random.sample(records, sample_size)
 
     filtered = []
     for r in records:
-        if (r.get("part_name") or "").lower() in ["engine assembly"] or "transmission" in (r.get("part_name") or "").lower():
+        name = (r.get("part_name") or "").lower()
+        if name == "engine assembly" or "transmission" in name:
             filtered.append(r)
 
-    log_queue = mp.Queue()
-    listener = mp.Process(target=log_listener, args=(log_queue,))
-    listener.start()
+    total_records = len(filtered)
+
+    logger.info(f"Total URLs to scrap: {total_records}")
+
+    async with get_aiohttp_session() as session:
+        tasks = [
+            scrape_record(r, idx + 1, total_records, session)
+            for idx, r in enumerate(filtered)
+        ]
+        tasks = tasks[0:2]
+        results = await asyncio.gather(*tasks)
 
     all_parts = []
     total_pages = 0
     total_bytes = 0
 
-    with mp.Pool(
-        processes=workers,
-        initializer=setup_worker_logger,
-        initargs=(log_queue,)
-    ) as pool:
-        for result in pool.imap_unordered(scrape_record_worker, filtered):
-            all_parts.extend(result["parts"])
-            total_pages += result["pages_scraped"]
-            total_bytes += result["total_bytes"]
-
-    log_queue.put(None)
-    listener.join()
+    for r in results:
+        all_parts.extend(r["parts"])
+        total_pages += r["pages_scraped"]
+        total_bytes += r["total_bytes"]
 
     return {
         "parts": all_parts,
@@ -593,17 +640,18 @@ def scrape_from_csv(csv_path, workers=4):
         "total_bytes": total_bytes
     }
 
-
 # ============================================================
 # RUN
 # ============================================================
 
 if __name__ == "__main__":
-    mp.freeze_support()
 
-    CSV_PATH = "output/parts_data.csv"
+    program_start_ts = time.perf_counter()
 
-    result = scrape_from_csv(CSV_PATH, workers=4)
+    CSV_PATH = "output/ic_parts_data_combined_with_links_from_autopartsearch.csv"
+
+    result = asyncio.run(scrape_from_csv(CSV_PATH))
+
     all_parts = result["parts"]
     total_pages = result["total_pages"]
     total_bytes = result["total_bytes"]
@@ -614,9 +662,11 @@ if __name__ == "__main__":
         f"AVERAGE page size: {int(total_bytes / total_pages) if total_pages else 0} bytes"
     )
 
-
     final_path = os.path.join(FINAL_DIR, f"parts_data_{RUN_DATE}.json")
     with open(final_path, "w", encoding="utf8") as f:
         json.dump(all_parts, f, indent=2)
+
+    program_elapsed_sec = round(time.perf_counter() - program_start_ts, 2)
+    logger.info(f"TOTAL runtime seconds: {program_elapsed_sec}")
 
     logger.info(f"Saved final parts file to {final_path}")
